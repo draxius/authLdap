@@ -170,10 +170,10 @@ function authLdap_options_panel()
  *
  * @return Org_Heigl\AuthLdap\LdapList LDAP server object
  */
-function authLdap_get_server()
+function authLdap_get_server($reset = false)
 {
 	static $_ldapserver = null;
-	if (is_null($_ldapserver)) {
+	if (is_null($_ldapserver) || $reset === "reset") {
 		$authLDAPDebug = authLdap_get_option('Debug');
 		$authLDAPURI = explode(
 			authLdap_get_option('URISeparator', ' '),
@@ -628,7 +628,8 @@ function authLdap_authz_update($user, $username)
 			$authLDAPUidAttr = 'uid';
 		}
 
-		authLdap_get_server()->bind();
+		// "reset" flag is present to force a recycling of the LdapList
+		authLdap_get_server("reset")->bind();
 
 		$attributes = array_values(
 			array_filter(
@@ -665,7 +666,16 @@ function authLdap_authz_update($user, $username)
 			$realuid = $attribs[0][strtolower($authLDAPUidAttr)][0];
 		} catch (Exception $e) {
 			authLdap_debug('Exception getting LDAP user: ' . $e->getMessage());
-			return false;
+			
+			// If the user can't bet found in LDAP, return false if the user was 
+			// previously meta-tagged as an authLDAP user...
+			if (get_user_meta($user->ID, 'authLDAP')) {
+				return false;
+			} else {
+				// otherwise, just return the user object back, so that existing
+				// "local" accounts can still work.
+				return $user;
+			}
 		}
 
 		$uid = authLdap_get_uid($realuid);
