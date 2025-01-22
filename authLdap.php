@@ -249,7 +249,8 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 		return $user;
 	}
 
-	global $wpdb, $error;
+	// Adding global $isLdapLogin to avoid duplicate processing of groups and user attributes
+	global $wpdb, $error, $isLdapLogin;
 	try {
 		$authLDAP = authLdap_get_option('Enabled');
 		$authLDAPFilter = authLdap_get_option('Filter');
@@ -264,8 +265,7 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 		$authLDAPUseUserAccount = authLdap_get_option('UserRead');
 
 		if (!$username) {
-			authLdap_debug('Username not supplied: return false #1');
-			authLdap_debug("User: " . $user);
+			authLdap_debug('Username not supplied: return false');
 			return false;
 		}
 
@@ -294,6 +294,8 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 		if ($already_md5) {
 			if ($password == md5($username) . md5($ldapCookieMarker)) {
 				authLdap_debug('cookie authentication');
+				// Since the user is logging in with an LDAP-based cookie, treat as an LDAP login
+				$isLdapLogin = true;
 				return true;
 			}
 		}
@@ -489,6 +491,9 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 			$userid = wp_insert_user($user_info);
 		}
 
+		// Set global $isLdapLogin to true
+		$isLdapLogin = true;
+
 		// if the user exists, wp_insert_user will update the existing user record
 		if (is_wp_error($userid)) {
 			authLdap_debug('Error creating user : ' . $userid->get_error_message());
@@ -529,16 +534,14 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 }
 
 /**
- * This method authenticates a user using either the LDAP or, if LDAP is not
- * available, the local database
- *
- * For this we store the hashed passwords in the WP_Database to ensure working
- * conditions even without an LDAP-Connection
+ * This method updates roles and user attributes after logging in with a non-LDAP authenication source
+ * 
+ * Much of the functionality here is mirrored from the authLdap_login function, with various 
+ * accommodations made for the differing login state
  *
  * @param null|WP_User|WP_Error
  * @param string $username
  * @return boolean true, if login was successfull or false, if it wasn't
- * @conf boolean authLDAP true, if authLDAP should be used, false if not. Defaults to false
  * @conf string authLDAPFilter LDAP filter to use to find correct user, defaults to '(uid=%s)'
  * @conf string authLDAPNameAttr LDAP attribute containing user (display) name, defaults to 'name'
  * @conf string authLDAPSecName LDAP attribute containing second name, defaults to ''
@@ -549,15 +552,22 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
  * @conf boolean authLDAPGroupEnable true, if we try to map LDAP groups to Wordpress roles
  * @conf boolean authLDAPGroupOverUser true, if LDAP Groups have precedence over existing user roles
  */
-function authLdap_add_roles_external_user($user, $username)
+function authLdap_authz_update($user, $username)
 {
+	// If $isLdapLogin is true - due to authLdap_login success - just kick back
+	// the supplied user and do nothing here
+	global $isLdapLogin;
+
+	if($isLdapLogin == true){
+		authLdap_debug('User authenticated via LDAP - skipping LDAP AuthZ and Update');
+		return $user;
+	}
+	
 	// If the user has already been authenticated (only in that case we get a
 	// WP_User-Object as $user) we skip LDAP-authentication and simply return
 	// the existing user-object
 	if (!($user instanceof WP_User)) {
-		authLdap_debug(sprintf(
-			'User is not has authenticated - skipping LDAP Group Assignment',
-		));
+		authLdap_debug('User is not authenticated - skipping LDAP AuthZ and Update');
 		return $user;
 	}
 
@@ -575,6 +585,16 @@ function authLdap_add_roles_external_user($user, $username)
 		return $user;
 	}
 
+	// Changing this behavior for Authorization-Only mode
+	// If we're note overwriting non-LDAP users, what are we even doing here?
+	// Rather than returning false, however, we'll just exit the function here
+	// by returning the $user object here, since authentication has already occurred.
+	if (true == authLdap_get_option('DoNotOverwriteNonLdapUsers', false)) {
+		if (get_userdata($uid) && !get_user_meta($uid, 'authLDAP')) {
+			return $user;
+		}
+	}
+
 	global $wpdb, $error;
 	try {
 		$authLDAP = authLdap_get_option('Enabled');
@@ -590,8 +610,7 @@ function authLdap_add_roles_external_user($user, $username)
 		$authLDAPUseUserAccount = authLdap_get_option('UserRead');
 
 		if (!$username) {
-			authLdap_debug('Username not supplied: return false #2');
-//			authLdap_debug($user);
+			authLdap_debug('Username not supplied: return false');
 			return false;
 		}
 
@@ -608,26 +627,9 @@ function authLdap_add_roles_external_user($user, $username)
 		if (!$authLDAPUidAttr) {
 			$authLDAPUidAttr = 'uid';
 		}
-/*
-		$result = false;
-		// Make optional querying from the admin account #213
-		if (!authLdap_get_option('UserRead')) {
-			// Rebind with the default credentials after the user has been loged in
-			// Otherwise the credentials of the user trying to login will be used
-			// This fixes #55
-			$result = authLdap_get_server()->Authenticate();
-			authLdap_get_server()->bind();
-		}
 
-		if (true !== $result) {
-			authLdap_debug('LDAP bind failed: ' . $result);
-			// TODO what to return? WP_User object, true, false, even an WP_Error object...
-			// all seem to fall back to normal wp user authentication
-			return;
-		}
-*/
 		authLdap_get_server()->bind();
-//		authLdap_debug('LDAP bind successful');
+
 		$attributes = array_values(
 			array_filter(
 				apply_filters(
@@ -667,13 +669,6 @@ function authLdap_add_roles_external_user($user, $username)
 		}
 
 		$uid = authLdap_get_uid($realuid);
-
-		// This fixes #172
-		if (true == authLdap_get_option('DoNotOverwriteNonLdapUsers', false)) {
-			if (get_userdata($uid) && !get_user_meta($uid, 'authLDAP')) {
-				return null;
-			}
-		}
 
 		$roles = [];
 
@@ -1238,7 +1233,7 @@ add_filter('show_password_fields', 'authLdap_show_password_fields', 10, 2);
 add_filter('allow_password_reset', 'authLdap_allow_password_reset', 10, 2);
 add_filter('authenticate', 'authLdap_login', 10, 3);
 /** Added to support ldap groups on users that authenticate with something other than LDAP**/
-add_filter('authenticate', 'authLdap_add_roles_external_user', 50, 3);
+add_filter('authenticate', 'authLdap_authz_update', 50, 3);
 /** This only works from WP 4.3.0 on */
 add_filter('send_password_change_email', 'authLdap_send_change_email', 10, 3);
 add_filter('send_email_change_email', 'authLdap_send_change_email', 10, 3);
