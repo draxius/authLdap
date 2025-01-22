@@ -51,6 +51,19 @@
                 </tr>
                 <tr>
                     <th>
+                        <label for="authLDAPExtUsers">EXPERIMENTAL Enable LDAP Group Lookup for other users?</label>
+                    </th>
+                    <td>
+                        <input type="checkbox" name="authLDAPExtUsers" id="authLDAPExtUsers" value="1"<?php echo $tExtChecked; ?>/>
+                        <p class="description">
+                            Shall we try to find the user in LDAP even if they logged in through a different mechanism? CAUTION: This has the potential to break access for users,
+			depending on the configuration of other settings.
+                        </p>
+                        <p class="description">This should only be checked if you know what you are doing!</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th>
                         <label for="authLDAPDebug">Debug AuthLDAP?</label>
                     </th>
                     <td>
