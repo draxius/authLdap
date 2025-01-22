@@ -83,6 +83,7 @@ function authLdap_options_panel()
 
 		$new_options = [
 			'Enabled' => authLdap_get_post('authLDAPAuth', false),
+			'ExternalUsers' => authLdap_get_post('authLDAPExtUsers', false),
 			'CachePW' => authLdap_get_post('authLDAPCachePW', false),
 			'URI' => authLdap_get_post('authLDAPURI'),
 			'URISeparator' => authLdap_get_post('authLDAPURISeparator'),
@@ -114,6 +115,7 @@ function authLdap_options_panel()
 
 	// Do some initialization for the admin-view
 	$authLDAP = authLdap_get_option('Enabled');
+	$authLDAPExtUsers = authLdap_get_option('ExternalUsers');
 	$authLDAPCachePW = authLdap_get_option('CachePW');
 	$authLDAPURI = authLdap_get_option('URI');
 	$authLDAPURISeparator = authLdap_get_option('URISeparator');
@@ -137,6 +139,7 @@ function authLdap_options_panel()
 	$authLDAPUseUserAccount = authLdap_get_option('UserRead');
 
 	$tChecked = ($authLDAP) ? ' checked="checked"' : '';
+	$tExtChecked = ($authLDAPExtUsers) ? ' checked="checked"' : '';
 	$tDebugChecked = ($authLDAPDebug) ? ' checked="checked"' : '';
 	$tPWChecked = ($authLDAPCachePW) ? ' checked="checked"' : '';
 	$tGroupChecked = ($authLDAPGroupEnable) ? ' checked="checked"' : '';
@@ -236,6 +239,7 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 			$user->get('nickname')
 		));
 		return $user;
+
 	}
 
 	authLdap_debug("User '$username' logging in");
@@ -260,7 +264,8 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 		$authLDAPUseUserAccount = authLdap_get_option('UserRead');
 
 		if (!$username) {
-			authLdap_debug('Username not supplied: return false');
+			authLdap_debug('Username not supplied: return false #1');
+			authLdap_debug("User: " . $user);
 			return false;
 		}
 
@@ -469,6 +474,298 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
 			// clear the password
 			$user_info['user_pass'] = '';
 		}
+
+		// add uid if user exists
+		if ($uid) {
+			// found user in the database
+			authLdap_debug('The LDAP user has an entry in the WP-Database');
+			$user_info['ID'] = $uid;
+			unset($user_info['display_name'], $user_info['nickname']);
+			$userid = wp_update_user($user_info);
+		} else {
+			// new wordpress account will be created
+			authLdap_debug('The LDAP user does not have an entry in the WP-Database, a new WP account will be created');
+
+			$userid = wp_insert_user($user_info);
+		}
+
+		// if the user exists, wp_insert_user will update the existing user record
+		if (is_wp_error($userid)) {
+			authLdap_debug('Error creating user : ' . $userid->get_error_message());
+			trigger_error('Error creating user: ' . $userid->get_error_message());
+			return $userid;
+		}
+
+		// Update user roles.
+		$user = new \WP_User($userid);
+
+		/**
+		 * Add hook for custom User-Role assignment
+		 *
+		 * @param WP_User $user This user-object will be returned. Can be modified as necessary in the actions.
+		 * @param array $roles
+		 */
+		do_action('authldap_user_roles', $user, $roles);
+
+		/**
+		 * Add hook for custom updates
+		 *
+		 * @param int $userid User ID.
+		 * @param array $attribs [0] Attributes retrieved from LDAP for the user.
+		 */
+		do_action('authLdap_login_successful', $userid, $attribs[0]);
+
+		authLdap_debug('user id = ' . $userid);
+
+		// flag the user as an ldap user so we can hide the password fields in the user profile
+		update_user_meta($userid, 'authLDAP', true);
+
+		// return a user object upon positive authorization
+		return $user;
+	} catch (Exception $e) {
+		authLdap_debug($e->getMessage() . '. Exception thrown in line ' . $e->getLine());
+		trigger_error($e->getMessage() . '. Exception thrown in line ' . $e->getLine());
+	}
+}
+
+/**
+ * This method authenticates a user using either the LDAP or, if LDAP is not
+ * available, the local database
+ *
+ * For this we store the hashed passwords in the WP_Database to ensure working
+ * conditions even without an LDAP-Connection
+ *
+ * @param null|WP_User|WP_Error
+ * @param string $username
+ * @return boolean true, if login was successfull or false, if it wasn't
+ * @conf boolean authLDAP true, if authLDAP should be used, false if not. Defaults to false
+ * @conf string authLDAPFilter LDAP filter to use to find correct user, defaults to '(uid=%s)'
+ * @conf string authLDAPNameAttr LDAP attribute containing user (display) name, defaults to 'name'
+ * @conf string authLDAPSecName LDAP attribute containing second name, defaults to ''
+ * @conf string authLDAPMailAttr LDAP attribute containing user e-mail, defaults to 'mail'
+ * @conf string authLDAPUidAttr LDAP attribute containing user id (the username we log on with), defaults to 'uid'
+ * @conf string authLDAPWebAttr LDAP attribute containing user website, defaults to ''
+ * @conf string authLDAPDefaultRole default role for authenticated user, defaults to ''
+ * @conf boolean authLDAPGroupEnable true, if we try to map LDAP groups to Wordpress roles
+ * @conf boolean authLDAPGroupOverUser true, if LDAP Groups have precedence over existing user roles
+ */
+function authLdap_add_roles_external_user($user, $username)
+{
+	// If the user has already been authenticated (only in that case we get a
+	// WP_User-Object as $user) we skip LDAP-authentication and simply return
+	// the existing user-object
+	if (!($user instanceof WP_User)) {
+		authLdap_debug(sprintf(
+			'User is not has authenticated - skipping LDAP Group Assignment',
+		));
+		return $user;
+	}
+
+	$username = $user->get('user_login');
+
+	authLdap_debug("User '$username' logged in via another method - attempting to assign roles");
+
+	if (!authLdap_get_option('ExternalUsers')) {
+		authLdap_debug('Doing nothing for user in ExternalUsers loop');
+		return $user;
+	}
+
+	if ($username == 'admin') {
+		authLdap_debug('Doing nothing for possible local user admin');
+		return $user;
+	}
+
+	global $wpdb, $error;
+	try {
+		$authLDAP = authLdap_get_option('Enabled');
+		$authLDAPFilter = authLdap_get_option('Filter');
+		$authLDAPNameAttr = authLdap_get_option('NameAttr');
+		$authLDAPSecName = authLdap_get_option('SecName');
+		$authLDAPMailAttr = authLdap_get_option('MailAttr');
+		$authLDAPUidAttr = authLdap_get_option('UidAttr');
+		$authLDAPWebAttr = authLdap_get_option('WebAttr');
+		$authLDAPDefaultRole = authLdap_get_option('DefaultRole');
+		$authLDAPGroupEnable = filter_var(authLdap_get_option('GroupEnable'), FILTER_VALIDATE_BOOLEAN);
+		$authLDAPGroupOverUser = filter_var(authLdap_get_option('GroupOverUser'), FILTER_VALIDATE_BOOLEAN);
+		$authLDAPUseUserAccount = authLdap_get_option('UserRead');
+
+		if (!$username) {
+			authLdap_debug('Username not supplied: return false #2');
+//			authLdap_debug($user);
+			return false;
+		}
+
+		// First check for valid values and set appropriate defaults
+		if (!$authLDAPFilter) {
+			$authLDAPFilter = '(uid=%s)';
+		}
+		if (!$authLDAPNameAttr) {
+			$authLDAPNameAttr = 'name';
+		}
+		if (!$authLDAPMailAttr) {
+			$authLDAPMailAttr = 'mail';
+		}
+		if (!$authLDAPUidAttr) {
+			$authLDAPUidAttr = 'uid';
+		}
+/*
+		$result = false;
+		// Make optional querying from the admin account #213
+		if (!authLdap_get_option('UserRead')) {
+			// Rebind with the default credentials after the user has been loged in
+			// Otherwise the credentials of the user trying to login will be used
+			// This fixes #55
+			$result = authLdap_get_server()->Authenticate();
+			authLdap_get_server()->bind();
+		}
+
+		if (true !== $result) {
+			authLdap_debug('LDAP bind failed: ' . $result);
+			// TODO what to return? WP_User object, true, false, even an WP_Error object...
+			// all seem to fall back to normal wp user authentication
+			return;
+		}
+*/
+		authLdap_get_server()->bind();
+//		authLdap_debug('LDAP bind successful');
+		$attributes = array_values(
+			array_filter(
+				apply_filters(
+					'authLdap_filter_attributes',
+					[
+						$authLDAPNameAttr,
+						$authLDAPSecName,
+						$authLDAPMailAttr,
+						$authLDAPWebAttr,
+						$authLDAPUidAttr,
+					]
+				)
+			)
+		);
+
+		try {
+			$attribs = authLdap_get_server()->search(
+				sprintf($authLDAPFilter, $username),
+				$attributes
+			);
+			// First get all the relevant group informations so we can see if
+			// whether have been changes in group association of the user
+			if (!isset($attribs[0]['dn'])) {
+				authLdap_debug('could not get user attributes from LDAP');
+				throw new UnexpectedValueException('dn has not been returned');
+			}
+			if (!isset($attribs[0][strtolower($authLDAPUidAttr)][0])) {
+				authLdap_debug('could not get user attributes from LDAP');
+				throw new UnexpectedValueException('The user-ID attribute has not been returned');
+			}
+
+			$dn = $attribs[0]['dn'];
+			$realuid = $attribs[0][strtolower($authLDAPUidAttr)][0];
+		} catch (Exception $e) {
+			authLdap_debug('Exception getting LDAP user: ' . $e->getMessage());
+			return false;
+		}
+
+		$uid = authLdap_get_uid($realuid);
+
+		// This fixes #172
+		if (true == authLdap_get_option('DoNotOverwriteNonLdapUsers', false)) {
+			if (get_userdata($uid) && !get_user_meta($uid, 'authLDAP')) {
+				return null;
+			}
+		}
+
+		$roles = [];
+
+		// we only need this if either LDAP groups are disabled or
+		// if the WordPress role of the user overrides LDAP groups
+		if ($authLDAPGroupEnable === false || $authLDAPGroupOverUser === false) {
+			$userRoles = authLdap_user_role($uid);
+			if ($userRoles !== []) {
+				$roles = array_merge($roles, $userRoles);
+			}
+			// TODO, this needs to be revised, it seems, like authldap is taking only the first role
+			// even if in WP there are assigned multiple.
+		}
+
+		// do LDAP group mapping if needed
+		// (if LDAP groups override wordpress user role, $role is still empty)
+		if ((empty($roles) || $authLDAPGroupOverUser === true) && $authLDAPGroupEnable === true) {
+			$mappedRoles = authLdap_groupmap($realuid, $dn);
+			if ($mappedRoles !== []) {
+				$roles = $mappedRoles;
+				authLdap_debug('role from group mapping: ' . json_encode($roles));
+			}
+		}
+
+		// if we don't have a role yet, use default role
+		if (empty($roles) && !empty($authLDAPDefaultRole)) {
+			authLdap_debug('no role yet, set default role');
+			$roles[] = $authLDAPDefaultRole;
+		}
+
+		if (empty($roles)) {
+			// Sorry, but you are not in any group that is allowed access
+			trigger_error('no group found');
+			authLdap_debug('user is not in any group that is allowed access');
+			return false;
+		} else {
+			$wp_roles = new WP_Roles();
+			// not sure if this is needed, but it can't hurt
+
+			// Get rid of unexisting roles.
+			foreach ($roles as $k => $v) {
+				if (!$wp_roles->is_role($v)) {
+					unset($k);
+				}
+			}
+
+			// check if single role or an empty array provided
+			if (empty($roles)) {
+				trigger_error('no group found');
+				authLdap_debug('role is invalid');
+				return false;
+			}
+		}
+
+		// from here on, the user has access!
+		// now, lets update some user details
+		$user_info = [];
+		$user_info['user_login'] = $realuid;
+		$user_info['user_email'] = '';
+		$user_info['user_nicename'] = '';
+
+		// first name
+		if (isset($attribs[0][strtolower((string) $authLDAPNameAttr)][0])) {
+			$user_info['first_name'] = $attribs[0][strtolower((string) $authLDAPNameAttr)][0];
+		}
+
+		// last name
+		if (isset($attribs[0][strtolower((string) $authLDAPSecName)][0])) {
+			$user_info['last_name'] = $attribs[0][strtolower((string) $authLDAPSecName)][0];
+		}
+
+		// mail address
+		if (isset($attribs[0][strtolower((string) $authLDAPMailAttr)][0])) {
+			$user_info['user_email'] = $attribs[0][strtolower((string) $authLDAPMailAttr)][0];
+		}
+
+		// website
+		if (isset($attribs[0][strtolower((string) $authLDAPWebAttr)][0])) {
+			$user_info['user_url'] = $attribs[0][strtolower((string) $authLDAPWebAttr)][0];
+		}
+		// display name, nickname, nicename
+		if (array_key_exists('first_name', $user_info)) {
+			$user_info['display_name'] = $user_info['first_name'];
+			$user_info['nickname'] = $user_info['first_name'];
+			$user_info['user_nicename'] = sanitize_title_with_dashes($user_info['first_name']);
+			if (array_key_exists('last_name', $user_info)) {
+				$user_info['display_name'] .= ' ' . $user_info['last_name'];
+				$user_info['nickname'] .= ' ' . $user_info['last_name'];
+				$user_info['user_nicename'] .= '_' . sanitize_title_with_dashes($user_info['last_name']);
+			}
+		}
+		$user_info['user_nicename'] = substr($user_info['user_nicename'], 0, 50);
 
 		// add uid if user exists
 		if ($uid) {
@@ -802,6 +1099,7 @@ function authLdap_load_options($reload = false)
 		// defaults for all options
 		$options_default = [
 			'Enabled' => false,
+			'ExternalUsers' => false,
 			'CachePW' => false,
 			'URI' => '',
 			'URISeparator' => ' ',
@@ -939,6 +1237,8 @@ add_action($hook . 'admin_menu', 'authLdap_addmenu');
 add_filter('show_password_fields', 'authLdap_show_password_fields', 10, 2);
 add_filter('allow_password_reset', 'authLdap_allow_password_reset', 10, 2);
 add_filter('authenticate', 'authLdap_login', 10, 3);
+/** Added to support ldap groups on users that authenticate with something other than LDAP**/
+add_filter('authenticate', 'authLdap_add_roles_external_user', 50, 3);
 /** This only works from WP 4.3.0 on */
 add_filter('send_password_change_email', 'authLdap_send_change_email', 10, 3);
 add_filter('send_email_change_email', 'authLdap_send_change_email', 10, 3);

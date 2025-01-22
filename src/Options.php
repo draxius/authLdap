@@ -17,6 +17,7 @@ use function array_key_exists;
 class Options
 {
 	public const ENABLED = 'Enabled';
+	public const EXTERNAL_USERS = 'ExternalUsers';
 	public const CACHE_PW = 'CachePW';
 	public const URI = 'URI';
 	public const URI_SEPARATOR = 'URISeparator';
@@ -38,6 +39,7 @@ class Options
 
 	private array $settings = [
 			'Enabled' => false,
+			'ExternalUsers' => false,
 			'CachePW' => false,
 			'URI' => '',
 			'URISeparator' => ' ',
