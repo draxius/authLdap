@@ -554,8 +554,8 @@ function authLdap_login($user, $username, $password, $already_md5 = false)
  */
 function authLdap_authz_update($user, $username)
 {
-	// If $isLdapLogin is true - due to authLdap_login success - just kick back
-	// the supplied user and do nothing here
+	// If $isLdapLogin is true - due to authLdap_login success - just return
+	// the supplied user object and do nothing here
 	global $isLdapLogin;
 
 	if($isLdapLogin == true){
